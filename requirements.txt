@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+redis
+pydantic-settings
+gunicorn
+asyncpg
+python-multipart
+httpx
+pgvector
+numpy
