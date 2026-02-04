@@ -1,10 +1,13 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
+import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException, status, Query
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings
-from sqlalchemy import select, text
+from sqlalchemy import select, text, func
 
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -18,12 +21,21 @@ from app.services import process_document, generate_embedding
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://user:password@db:5432/mydatabase"
     redis_url: str = "redis://redis:6379/0"
+    chromadb_url: str = "http://host.docker.internal:8100"
+    chromadb_collection_id: str = "69b78eb9-e090-42c2-b76d-9bf474088204"
 
     class Config:
         env_file = ".env"
 
 
 settings = Settings()
+
+
+# --- Stats Response Model ---
+class StatsResponse(BaseModel):
+    documents: int
+    memories: int
+    status: str
 
 # --- Database Setup ---
 DATABASE_URL = settings.database_url
@@ -197,6 +209,48 @@ async def get_document_info(doc_id: int):
             )
 
         return DocumentResponse.model_validate(document)
+
+
+@app.get("/stats", response_model=StatsResponse)
+async def get_stats():
+    """
+    Get live system statistics.
+
+    Returns document count from Postgres and memory count from ChromaDB.
+    """
+    documents = 0
+    memories = 0
+    status = "ONLINE"
+
+    # Count documents in Postgres
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(func.count(Document.id)))
+            documents = result.scalar() or 0
+    except Exception as e:
+        print(f"[STATS] Postgres error: {e}")
+        status = "DEGRADED"
+
+    # Count memories in ChromaDB
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            chroma_url = (
+                f"{settings.chromadb_url}/api/v2/tenants/default_tenant/"
+                f"databases/default_database/collections/{settings.chromadb_collection_id}/count"
+            )
+            response = await client.get(chroma_url)
+            if response.status_code == 200:
+                memories = int(response.text)
+    except Exception as e:
+        print(f"[STATS] ChromaDB error: {e}")
+        # ChromaDB being down doesn't mean full degradation
+        memories = -1  # Indicate unavailable
+
+    return StatsResponse(
+        documents=documents,
+        memories=memories,
+        status=status
+    )
 
 
 @app.get("/")
