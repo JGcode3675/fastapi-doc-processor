@@ -1,6 +1,7 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import AsyncGenerator
 
 import httpx
@@ -36,6 +37,30 @@ class StatsResponse(BaseModel):
     documents: int
     memories: int
     status: str
+
+
+# --- Chat Models ---
+class ChatRequest(BaseModel):
+    query: str
+    model: str = "moltbot"
+    system_prompt: str | None = None
+
+
+class ChatResponse(BaseModel):
+    response: str
+    model: str
+    tokens_used: int | None = None
+
+
+# --- Briefing Models ---
+class BriefingRequest(BaseModel):
+    legs: list[str] = ["market", "news", "osint", "tech"]
+
+
+class BriefingResponse(BaseModel):
+    markdown_report: str
+    timestamp: str
+    document_count: int
 
 # --- Database Setup ---
 DATABASE_URL = settings.database_url
@@ -251,6 +276,192 @@ async def get_stats():
         memories=memories,
         status=status
     )
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Chat with Moltbot - the AI Systems Architect.
+
+    Uses Ollama for local LLM inference. Supports custom system prompts.
+    """
+    # Default Moltbot system prompt
+    default_system = (
+        "You are Moltbot, a Senior Systems Architect and Trading Sentinel. "
+        "You are concise, technical, and cynical. You prioritize facts over pleasantries. "
+        "Answer in Markdown. Use code blocks for technical content."
+    )
+
+    system_prompt = request.system_prompt or default_system
+    model_name = "llama3.2:3b"  # Local Ollama model
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            # Call Ollama API
+            ollama_response = await client.post(
+                "http://host.docker.internal:11434/api/chat",
+                json={
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": request.query},
+                    ],
+                    "stream": False,
+                },
+            )
+
+            if ollama_response.status_code == 200:
+                data = ollama_response.json()
+                answer = data.get("message", {}).get("content", "")
+                return ChatResponse(
+                    response=answer,
+                    model=request.model,
+                    tokens_used=data.get("eval_count"),
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Ollama error: {ollama_response.status_code}",
+                )
+
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ollama service unavailable. Is it running?",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="LLM request timed out",
+        )
+
+
+@app.post("/briefing/generate", response_model=BriefingResponse)
+async def generate_briefing(request: BriefingRequest):
+    """
+    Generate a daily intelligence briefing from recent documents.
+
+    Queries documents indexed in the last 24 hours, truncates content,
+    and generates a Moltbot-style briefing via Ollama.
+    """
+    from datetime import timedelta
+
+    documents_data = []
+
+    async with AsyncSessionLocal() as session:
+        # Query documents from last 24 hours with summaries
+        cutoff = datetime.now() - timedelta(hours=24)
+        result = await session.execute(
+            text("""
+                SELECT DISTINCT ON (filename) filename, summary, content, created_at
+                FROM documents
+                WHERE status = 'completed'
+                  AND created_at > :cutoff
+                ORDER BY filename, created_at DESC
+                LIMIT 10
+            """),
+            {"cutoff": cutoff},
+        )
+        rows = result.fetchall()
+
+        # Fallback to top 5 most recent if none in last 24h
+        if not rows:
+            result = await session.execute(
+                text("""
+                    SELECT DISTINCT ON (filename) filename, summary, content, created_at
+                    FROM documents
+                    WHERE status = 'completed'
+                    ORDER BY filename, created_at DESC
+                    LIMIT 5
+                """)
+            )
+            rows = result.fetchall()
+
+        for row in rows:
+            # Truncate content to 3000 chars to avoid context overflow
+            content_excerpt = ""
+            if row.summary:
+                content_excerpt = row.summary[:1500]
+            elif row.content:
+                content_excerpt = row.content[:3000]
+
+            documents_data.append({
+                "filename": row.filename,
+                "excerpt": content_excerpt,
+            })
+
+    # If no documents, return empty briefing
+    if not documents_data:
+        return BriefingResponse(
+            markdown_report="## No Intelligence Available\n\nNo documents have been indexed yet.",
+            timestamp=datetime.now().isoformat(),
+            document_count=0,
+        )
+
+    # Build context for Ollama
+    doc_context = "\n\n".join([
+        f"**{d['filename']}**:\n{d['excerpt']}" for d in documents_data
+    ])
+
+    system_prompt = """You are Moltbot, a tactical intelligence analyst for the AI Nervous System.
+Summarize these document excerpts into a daily briefing.
+
+Structure your response with these exact sections:
+## 🛑 Critical Risks
+## 🎯 Opportunities
+## ⚡ Tech Watch
+
+Rules:
+- Be concise. Use bullet points.
+- If no relevant info for a section, state 'N/A'.
+- Focus on actionable intelligence."""
+
+    user_prompt = f"Generate a daily briefing from these {len(documents_data)} documents:\n\n{doc_context}"
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            ollama_response = await client.post(
+                "http://host.docker.internal:11434/api/chat",
+                json={
+                    "model": "llama3.2:3b",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                },
+            )
+
+            if ollama_response.status_code == 200:
+                data = ollama_response.json()
+                markdown_report = data.get("message", {}).get("content", "")
+                return BriefingResponse(
+                    markdown_report=markdown_report,
+                    timestamp=datetime.now().isoformat(),
+                    document_count=len(documents_data),
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Ollama error: {ollama_response.status_code}",
+                )
+
+    except httpx.ConnectError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ollama service unavailable. Is it running?",
+        )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Briefing generation timed out",
+        )
+
+
+@app.get("/health")
+async def health_check():
+    """Simple health check endpoint for monitoring."""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 
 @app.get("/")
