@@ -1,70 +1,35 @@
-import asyncio
-import os
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import AsyncGenerator
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException, status, Query
-from pydantic import BaseModel
-from pydantic_settings import BaseSettings
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, text, func
-
-import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
-from app.models import Base, Document
-from app.schemas import DocumentResponse, UploadResponse, SearchResponse, SearchResult
-from app.services import process_document, generate_embedding
+import redis.asyncio as redis
+from arq import create_pool
+from arq.connections import RedisSettings
 
+from app.config import get_settings
+from app.logging_config import setup_logging, get_logger
+from app.models import Base, Document, ChatSession, ChatMessage as ChatMessageModel
+from app.schemas import (
+    DocumentResponse, UploadResponse, SearchResponse, SearchResult,
+    ChatRequest, ChatResponse, ChatSessionResponse, StatsResponse,
+    BriefingRequest, BriefingResponse,
+)
+from app.services import generate_embedding
+from app.agents import MoltbotAgent
 
-# --- Settings ---
-class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://user:password@db:5432/mydatabase"
-    redis_url: str = "redis://redis:6379/0"
-    chromadb_url: str = "http://host.docker.internal:8100"
-    chromadb_collection_id: str = "69b78eb9-e090-42c2-b76d-9bf474088204"
+setup_logging()
+log = get_logger(__name__)
 
-    class Config:
-        env_file = ".env"
-
-
-settings = Settings()
-
-
-# --- Stats Response Model ---
-class StatsResponse(BaseModel):
-    documents: int
-    memories: int
-    status: str
-
-
-# --- Chat Models ---
-class ChatRequest(BaseModel):
-    query: str
-    model: str = "moltbot"
-    system_prompt: str | None = None
-
-
-class ChatResponse(BaseModel):
-    response: str
-    model: str
-    tokens_used: int | None = None
-
-
-# --- Briefing Models ---
-class BriefingRequest(BaseModel):
-    legs: list[str] = ["market", "news", "osint", "tech"]
-
-
-class BriefingResponse(BaseModel):
-    markdown_report: str
-    timestamp: str
-    document_count: int
+settings = get_settings()
 
 # --- Database Setup ---
-DATABASE_URL = settings.database_url
-engine = create_async_engine(DATABASE_URL)
+engine = create_async_engine(settings.database_url)
 AsyncSessionLocal = async_sessionmaker(
     autocommit=False, autoflush=False, bind=engine, class_=AsyncSession
 )
@@ -78,26 +43,42 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 # --- Redis Setup ---
 redis_client: redis.Redis = None
 
+# --- WebSocket Connection Manager ---
+ws_clients: set[WebSocket] = set()
+
+
+async def broadcast_ws(event: dict) -> None:
+    """Broadcast a JSON event to all connected WebSocket clients."""
+    data = json.dumps(event)
+    disconnected = set()
+    for ws in ws_clients:
+        try:
+            await ws.send_text(data)
+        except Exception:
+            disconnected.add(ws)
+    ws_clients.difference_update(disconnected)
+
+
 # --- Lifespan Management ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Connect to DB and Redis
-    print("Application startup: Connecting to DB and Redis...")
-
-    # Enable pgvector extension
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        await conn.run_sync(Base.metadata.create_all)
+    log.info("app_startup", msg="Connecting to DB and Redis")
 
     global redis_client
     redis_client = redis.from_url(settings.redis_url)
-    print("Connected to DB and Redis. pgvector extension enabled.")
+
+    # Create ARQ pool for task enqueueing
+    arq_settings = RedisSettings.from_dsn(settings.redis_url)
+    app.state.arq_pool = await create_pool(arq_settings)
+
+    log.info("app_ready", msg="DB, Redis, and ARQ pool connected")
     yield
-    # Shutdown: Close DB and Redis connections
-    print("Application shutdown: Closing DB and Redis connections...")
+
+    log.info("app_shutdown", msg="Closing connections")
     if redis_client:
         await redis_client.close()
-    print("DB and Redis connections closed.")
+    await app.state.arq_pool.close()
+    log.info("app_shutdown_complete")
 
 
 # --- FastAPI App ---
@@ -109,13 +90,11 @@ app = FastAPI(lifespan=lifespan, title="Document Processor API")
 async def upload_document(file: UploadFile = File(...)):
     """
     Upload a document for processing.
-    Saves record to Postgres with status 'processing' and triggers background task.
+    Saves record to Postgres with status 'processing' and enqueues ARQ job.
     """
-    # Read file content to get size
     content = await file.read()
     file_size = len(content)
 
-    # Create document record in database
     async with AsyncSessionLocal() as session:
         document = Document(
             filename=file.filename,
@@ -128,12 +107,24 @@ async def upload_document(file: UploadFile = File(...)):
         await session.refresh(document)
 
         doc_id = document.id
-        print(f"Created document record: id={doc_id}, filename={file.filename}")
+        log.info("doc_uploaded", doc_id=doc_id, filename=file.filename, size=file_size)
 
-        # Trigger background processing task with file content
-        asyncio.create_task(
-            process_document(doc_id, content, file.filename, AsyncSessionLocal)
+        # Enqueue ARQ job instead of fire-and-forget asyncio.create_task
+        await app.state.arq_pool.enqueue_job(
+            "process_document_task", doc_id, content, file.filename
         )
+
+        # Publish initial status via Redis pubsub for WebSocket clients
+        if redis_client:
+            await redis_client.publish(
+                "ws:events",
+                json.dumps({
+                    "type": "doc_status",
+                    "doc_id": doc_id,
+                    "status": "processing",
+                    "progress": 0,
+                }),
+            )
 
         return UploadResponse(
             message="Document uploaded successfully",
@@ -146,11 +137,7 @@ async def search_documents(
     q: str = Query(..., min_length=1, description="Search query"),
     limit: int = Query(default=5, ge=1, le=20, description="Number of results"),
 ):
-    """
-    Semantic search across documents using vector similarity.
-    Embeds the query and finds most similar documents using cosine similarity.
-    """
-    # Generate embedding for the query
+    """Semantic search across documents using vector similarity."""
     query_embedding = await generate_embedding(q)
 
     if not query_embedding:
@@ -159,10 +146,7 @@ async def search_documents(
             detail="Embedding service unavailable",
         )
 
-    # Search using cosine similarity (1 - cosine_distance)
     async with AsyncSessionLocal() as session:
-        # Use pgvector's cosine distance operator (<=>)
-        # Lower distance = more similar, so we order ascending
         result = await session.execute(
             text("""
                 SELECT
@@ -189,74 +173,56 @@ async def search_documents(
             for row in rows
         ]
 
-        return SearchResponse(
-            query=q,
-            results=results,
-            count=len(results),
-        )
+        return SearchResponse(query=q, results=results, count=len(results))
 
 
 @app.get("/status/{doc_id}", response_model=DocumentResponse)
 async def get_document_status(doc_id: int):
-    """
-    Get the status of a document by ID.
-    """
+    """Get the status of a document by ID."""
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Document).where(Document.id == doc_id)
         )
         document = result.scalar_one_or_none()
-
         if not document:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {doc_id} not found",
             )
-
         return DocumentResponse.model_validate(document)
 
 
 @app.get("/docs/{doc_id}", response_model=DocumentResponse)
 async def get_document_info(doc_id: int):
-    """
-    Retrieve information about a document.
-    """
+    """Retrieve information about a document."""
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Document).where(Document.id == doc_id)
         )
         document = result.scalar_one_or_none()
-
         if not document:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Document {doc_id} not found",
             )
-
         return DocumentResponse.model_validate(document)
 
 
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats():
-    """
-    Get live system statistics.
-
-    Returns document count from Postgres and memory count from ChromaDB.
-    """
+    """Get live system statistics."""
     documents = 0
     memories = 0
-    status = "ONLINE"
+    sys_status = "ONLINE"
 
-    # Count documents in Postgres
     try:
         async with AsyncSessionLocal() as session:
             result = await session.execute(select(func.count(Document.id)))
             documents = result.scalar() or 0
     except Exception as e:
-        print(f"[STATS] Postgres error: {e}")
-        status = "DEGRADED"
+        log.error("stats_postgres_error", error=str(e))
+        sys_status = "DEGRADED"
 
-    # Count memories in ChromaDB
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             chroma_url = (
@@ -267,63 +233,38 @@ async def get_stats():
             if response.status_code == 200:
                 memories = int(response.text)
     except Exception as e:
-        print(f"[STATS] ChromaDB error: {e}")
-        # ChromaDB being down doesn't mean full degradation
-        memories = -1  # Indicate unavailable
+        log.warning("stats_chromadb_error", error=str(e))
+        memories = -1
 
-    return StatsResponse(
-        documents=documents,
-        memories=memories,
-        status=status
-    )
+    return StatsResponse(documents=documents, memories=memories, status=sys_status)
 
+
+# --- Chat Endpoints ---
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """
     Chat with Moltbot - the AI Systems Architect.
 
-    Uses Ollama for local LLM inference. Supports custom system prompts.
+    Supports session-based history, RAG, and tool use via MoltbotAgent.
     """
-    # Default Moltbot system prompt
-    default_system = (
-        "You are Moltbot, a Senior Systems Architect and Trading Sentinel. "
-        "You are concise, technical, and cynical. You prioritize facts over pleasantries. "
-        "Answer in Markdown. Use code blocks for technical content."
+    agent = MoltbotAgent(
+        session_factory=AsyncSessionLocal,
+        settings=settings,
     )
 
-    system_prompt = request.system_prompt or default_system
-    model_name = "llama3.2:3b"  # Local Ollama model
-
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            # Call Ollama API
-            ollama_response = await client.post(
-                "http://host.docker.internal:11434/api/chat",
-                json={
-                    "model": model_name,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": request.query},
-                    ],
-                    "stream": False,
-                },
-            )
-
-            if ollama_response.status_code == 200:
-                data = ollama_response.json()
-                answer = data.get("message", {}).get("content", "")
-                return ChatResponse(
-                    response=answer,
-                    model=request.model,
-                    tokens_used=data.get("eval_count"),
-                )
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"Ollama error: {ollama_response.status_code}",
-                )
-
+        response_text, tokens = await agent.chat(
+            user_message=request.query,
+            session_id=request.session_id,
+            system_prompt=request.system_prompt,
+        )
+        return ChatResponse(
+            response=response_text,
+            model=request.model,
+            tokens_used=tokens,
+            session_id=request.session_id,
+        )
     except httpx.ConnectError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -336,20 +277,61 @@ async def chat(request: ChatRequest):
         )
 
 
+@app.get("/chat/sessions", response_model=list[ChatSessionResponse])
+async def list_chat_sessions():
+    """List all chat sessions."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ChatSession).order_by(ChatSession.created_at.desc())
+        )
+        sessions = result.scalars().all()
+        return [ChatSessionResponse.model_validate(s) for s in sessions]
+
+
+@app.get("/chat/sessions/{session_id}", response_model=ChatSessionResponse)
+async def get_chat_session(session_id: int):
+    """Get a chat session with message history."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ChatSession).where(ChatSession.id == session_id)
+        )
+        chat_session = result.scalar_one_or_none()
+        if not chat_session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} not found",
+            )
+        return ChatSessionResponse.model_validate(chat_session)
+
+
+@app.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: int):
+    """Delete a chat session and its messages."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ChatSession).where(ChatSession.id == session_id)
+        )
+        chat_session = result.scalar_one_or_none()
+        if not chat_session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} not found",
+            )
+        await session.delete(chat_session)
+        await session.commit()
+        return {"message": f"Session {session_id} deleted"}
+
+
+# --- Briefing ---
+
 @app.post("/briefing/generate", response_model=BriefingResponse)
 async def generate_briefing(request: BriefingRequest):
-    """
-    Generate a daily intelligence briefing from recent documents.
-
-    Queries documents indexed in the last 24 hours, truncates content,
-    and generates a Moltbot-style briefing via Ollama.
-    """
+    """Generate a daily intelligence briefing from recent documents."""
     from datetime import timedelta
 
     documents_data = []
 
     async with AsyncSessionLocal() as session:
-        # Query documents from last 24 hours with summaries
         cutoff = datetime.now() - timedelta(hours=24)
         result = await session.execute(
             text("""
@@ -364,7 +346,6 @@ async def generate_briefing(request: BriefingRequest):
         )
         rows = result.fetchall()
 
-        # Fallback to top 5 most recent if none in last 24h
         if not rows:
             result = await session.execute(
                 text("""
@@ -378,7 +359,6 @@ async def generate_briefing(request: BriefingRequest):
             rows = result.fetchall()
 
         for row in rows:
-            # Truncate content to 3000 chars to avoid context overflow
             content_excerpt = ""
             if row.summary:
                 content_excerpt = row.summary[:1500]
@@ -390,7 +370,6 @@ async def generate_briefing(request: BriefingRequest):
                 "excerpt": content_excerpt,
             })
 
-    # If no documents, return empty briefing
     if not documents_data:
         return BriefingResponse(
             markdown_report="## No Intelligence Available\n\nNo documents have been indexed yet.",
@@ -398,7 +377,6 @@ async def generate_briefing(request: BriefingRequest):
             document_count=0,
         )
 
-    # Build context for Ollama
     doc_context = "\n\n".join([
         f"**{d['filename']}**:\n{d['excerpt']}" for d in documents_data
     ])
@@ -407,9 +385,9 @@ async def generate_briefing(request: BriefingRequest):
 Summarize these document excerpts into a daily briefing.
 
 Structure your response with these exact sections:
-## 🛑 Critical Risks
-## 🎯 Opportunities
-## ⚡ Tech Watch
+## Critical Risks
+## Opportunities
+## Tech Watch
 
 Rules:
 - Be concise. Use bullet points.
@@ -421,9 +399,9 @@ Rules:
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             ollama_response = await client.post(
-                "http://host.docker.internal:11434/api/chat",
+                settings.ollama_chat_url,
                 json={
-                    "model": "llama3.2:3b",
+                    "model": settings.ollama_llm_model,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -457,6 +435,54 @@ Rules:
             detail="Briefing generation timed out",
         )
 
+
+# --- WebSocket ---
+
+@app.websocket("/ws/status")
+async def websocket_status(ws: WebSocket):
+    """
+    WebSocket endpoint for real-time system events.
+
+    Subscribes to Redis pubsub and pushes all events to connected clients.
+    Protocol:
+        {"type": "doc_status", "doc_id": 123, "status": "embedding", "progress": 50}
+        {"type": "system", "event": "worker_ready", "workers": 4}
+    """
+    await ws.accept()
+    ws_clients.add(ws)
+    log.info("ws_client_connected", total=len(ws_clients))
+
+    pubsub = redis_client.pubsub()
+    await pubsub.subscribe("ws:events")
+
+    try:
+        while True:
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=1.0
+            )
+            if message and message["type"] == "message":
+                await ws.send_text(message["data"].decode() if isinstance(message["data"], bytes) else message["data"])
+
+            # Also check if WebSocket client sent anything (ping/pong)
+            try:
+                data = await ws.receive_text()
+                if data == "ping":
+                    await ws.send_text(json.dumps({"type": "pong"}))
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                pass
+
+    except WebSocketDisconnect:
+        pass
+    finally:
+        ws_clients.discard(ws)
+        await pubsub.unsubscribe("ws:events")
+        await pubsub.close()
+        log.info("ws_client_disconnected", total=len(ws_clients))
+
+
+# --- Health ---
 
 @app.get("/health")
 async def health_check():

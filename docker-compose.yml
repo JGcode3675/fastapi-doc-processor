@@ -1,21 +1,45 @@
 version: '3.8'
 
 services:
+  migrate:
+    build: .
+    command: alembic upgrade head
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://user:password@db:5432/mydatabase
+    depends_on:
+      db:
+        condition: service_started
+
   app:
     build: .
     ports:
       - "8000:8000"
     volumes:
-      - ./app:/app
+      - ./app:/code/app
     environment:
       - DATABASE_URL=postgresql+asyncpg://user:password@db:5432/mydatabase
       - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
     depends_on:
-      - db
-      - redis
-    # Optimized for M4 Pro with high-concurrency settings
-    # Adjust workers and threads based on M4 Pro core count and typical load
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    # M4 Pro: 4 workers, 4 threads for high concurrency
     command: gunicorn app.main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --threads 4 --log-level debug
+
+  worker:
+    build: .
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://user:password@db:5432/mydatabase
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    command: arq app.tasks.WorkerSettings
 
   db:
     image: pgvector/pgvector:pg16

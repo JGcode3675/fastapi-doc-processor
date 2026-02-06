@@ -9,3 +9,9 @@ python-multipart
 httpx
 pgvector
 numpy
+arq
+structlog
+alembic
+websockets
+pytest
+pytest-asyncio
